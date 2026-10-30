@@ -687,12 +687,29 @@ function set_preferences!(; force::Bool=true, kwargs...)
 end
 
 """
+    run_toplevel_testset(mod, ts, pat, stats, chan)
+
+Make the top-level testset `ts` of module `mod` and evaluate it, in the process that calls this.
+"""
+function run_toplevel_testset(mod, ts, pat, stats, chan)
+    mts = make_ts(ts, pat, stats, chan)
+    # Run in a fresh dynamic scope so a surrounding
+    # Test.@testset (whose CURRENT_TESTSET is now a
+    # ScopedValue on Julia 1.13+) doesn't make our
+    # top-level testset look nested.
+    return @with(Test.CURRENT_TESTSET => Test.FallbackTestSet(),
+                 Test.TESTSET_DEPTH => 0,
+                 Core.eval(mod, mts))
+end
+
+"""
     retest(mod..., pattern...;
            dry::Bool=false, stats::Bool=false, verbose::Real=true,
            [id::Bool], shuffle::Bool=false, recursive::Bool=true,
            static::Union{Bool,Nothing}=nothing, dup::Bool=false,
            load::Bool=false, seed::Union{Integer,Bool}=false,
-           marks::Bool=true, tag=[], spin::Bool=true, failfast::Bool=true)
+           marks::Bool=true, tag=[], spin::Bool=true, failfast::Bool=true,
+           tasks::Integer=1)
 
 Run tests declared with [`@testset`](@ref) blocks, within modules `mod` if specified,
 or within all currently loaded modules otherwise.
@@ -750,6 +767,10 @@ Filtering `pattern`s can be specified to run only a subset of the tests.
 * When `failfast` is `true`, no further testset starts after the first one which
   doesn't pass, and only results up to it are printed. When `false`, every selected
   testset runs and prints; `retest` still throws at the end if one didn't pass.
+* The `tasks` keyword (default `1`) runs that many top-level testsets at once, each in its
+  own task spawned on any thread of this process. It requires that no worker process was
+  added (`nprocs() == 1`) and `Threads.nthreads() >= tasks`; tests then share globals, so
+  they must not assume a process of their own.
 
 The default values of these keywords can be overriden by defining a dictionary
 or named tuple within `Main` called `__retest_defaults__`, whose keys are
@@ -852,7 +873,15 @@ function retest(@nospecialize(args::ArgType...);
                 # clear: clear marks for matching tests, only active if dry=true
                 clear::Bool         = def(:clear),
                 failfast::Bool      = def(:failfast),
+                tasks::Integer      = 1,
                 )
+
+    if tasks < 1
+        throw(ArgumentError("tasks must be at least 1, got $tasks"))
+    end
+    if tasks > 1 && nprocs() > 1
+        throw(ArgumentError("tasks > 1 runs testsets in this process only; remove the worker processes first"))
+    end
 
     dry, stats, shuffle, group, verbose, recursive, id, strict, dup, static, marks, spin =
         update_keywords(args, dry, stats, shuffle, group, verbose, recursive, id, strict, dup, static, marks, spin)
@@ -959,7 +988,7 @@ function retest(@nospecialize(args::ArgType...);
 
         outchan = RemoteChannel(() -> Channel{Maybe{Testset.ReTestSet}}(0))
         computechan = nprocs() == 1 ?
-            Channel{Nothing}(1) : # to not interrupt printer task
+            Channel{Nothing}(tasks) : # to not interrupt printer task
             nothing
 
         ntests = 0
@@ -1173,7 +1202,9 @@ function retest(@nospecialize(args::ArgType...);
                 ntests += 1
                 put!(outchan, module_ts) # printer task will take care of feeding computechan
             else
-                @async put!(computechan, nothing)
+                for _ in 1:tasks
+                    @async put!(computechan, nothing)
+                end
             end
 
             if seed !== false
@@ -1185,7 +1216,7 @@ function retest(@nospecialize(args::ArgType...);
                 @everywhere Base.include_string(Main, $includestr)
             end
 
-            @sync for wrkr in workers()
+            @sync for wrkr in repeat(workers(), tasks)
                 @async begin
                     if nprocs() == 1
                         take!(computechan)
@@ -1232,17 +1263,11 @@ function retest(@nospecialize(args::ArgType...);
                         end
 
                         chan = (out=outchan, compute=computechan, preview=previewchan)
-                        resp = remotecall_fetch(wrkr, mod, ts, pat, chan
-                                             ) do mod, ts, pat, chan
-                                mts = make_ts(ts, pat, format.stats, chan)
-                                # Run in a fresh dynamic scope so a surrounding
-                                # Test.@testset (whose CURRENT_TESTSET is now a
-                                # ScopedValue on Julia 1.13+) doesn't make our
-                                # top-level testset look nested.
-                                @with(Test.CURRENT_TESTSET => Test.FallbackTestSet(),
-                                      Test.TESTSET_DEPTH => 0,
-                                      Core.eval(mod, mts))
-                            end
+                        resp = if tasks > 1
+                            fetch(Threads.@spawn run_toplevel_testset(mod, ts, pat, format.stats, chan))
+                        else
+                            remotecall_fetch(run_toplevel_testset, wrkr, mod, ts, pat, format.stats, chan)
+                        end
                         if resp isa Vector
                             ntests += length(resp)
                             append!(module_ts.results, resp)

@@ -1300,6 +1300,40 @@ end # FailingKeepsGoing
 """)
 end
 
+module ConcurrentTasks
+using ReTest
+
+const STARTS = Ref(0)  # testsets running at once (the test below needs shared state)
+const PEAK = Ref(0)
+const GATE = ReentrantLock()
+
+for name in ("first", "second", "third", "fourth")
+    @eval @testset $name begin
+        lock(GATE) do
+            STARTS[] += 1
+            PEAK[] = max(PEAK[], STARTS[])
+        end
+        sleep(1)
+        lock(GATE) do
+            STARTS[] -= 1
+        end
+        @test true
+    end
+end
+
+end # ConcurrentTasks
+
+@chapter ConcurrentTasks begin
+    @test_throws ArgumentError retest(ConcurrentTasks, tasks=0)
+    retest(ConcurrentTasks, verbose=0, tasks=1)
+    @test ConcurrentTasks.PEAK[] == 1
+    ConcurrentTasks.PEAK[] = 0
+    if Threads.nthreads() >= 4
+        retest(ConcurrentTasks, verbose=0, tasks=4)
+        @test ConcurrentTasks.PEAK[] > 1
+    end
+end
+
 module FailingTestLogs
 using ReTest
 using Test: @test_logs
